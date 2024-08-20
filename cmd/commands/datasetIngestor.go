@@ -105,28 +105,26 @@ For Windows you need instead to specify -user username:password on the command l
 		}
 
 		metadatafile := args[0]
-		filelistingPath := ""
-		folderlistingPath := ""
+		datasetFileListTxt := ""
+		folderListingTxt := ""
 		absFileListing := ""
 		if len(args) == 2 {
-			if args[1] == "folderlisting.txt" {
-				folderlistingPath = args[1]
+			argFileName := filepath.Base(args[1])
+			if argFileName == "folderlisting.txt" {
+				// NOTE folderListingTxt is a TEXT FILE that lists dataset folders that should all be ingested together
+				//   WITH the same metadata EXCEPT for the sourceFolder path (which is set during ingestion)
+				folderListingTxt = args[1]
 			} else {
-				// NOTE filelistingPath is some kind of path to which the sourceFolder path should be relative
-				filelistingPath = args[1]
-				absFileListing, _ = filepath.Abs(filelistingPath)
+				// NOTE datasetFileListTxt is a TEXT FILE that lists the files & folders of a dataset (contained in a folder)
+				//   that should be considered as "part of" the dataset. The paths must be relative to the sourceFolder.
+				datasetFileListTxt = args[1]
+				absFileListing, _ = filepath.Abs(datasetFileListTxt)
 			}
 		}
 
 		if datasetUtils.TestArgs != nil {
-			datasetUtils.TestArgs([]interface{}{metadatafile, filelistingPath, folderlistingPath})
+			datasetUtils.TestArgs([]interface{}{metadatafile, datasetFileListTxt, folderListingTxt})
 			return
-		}
-
-		// functions use this flag in a way where "nil -> unset"
-		var allowExistingSourceFolderPtr *bool = &allowExistingSourceFolder
-		if !noninteractiveFlag && !cmd.Flags().Lookup("allowexistingsource").Changed {
-			allowExistingSourceFolderPtr = nil
 		}
 
 		if showVersion {
@@ -165,53 +163,74 @@ For Windows you need instead to specify -user username:password on the command l
 		color.Unset()
 
 		// TODO: change pointer parameter types to values as they shouldn't be modified by the function
-		auth := &datasetUtils.RealAuthenticator{}
-		user, accessGroups := datasetUtils.Authenticate(auth, client, APIServer, &token, &userpass)
+		user, accessGroups := authenticate(RealAuthenticator{}, client, APIServer, userpass, token)
 
 		/* TODO Add info about policy settings and that autoarchive will take place or not */
-
 		metaDataMap, metaSourceFolder, beamlineAccount, err := datasetIngestor.ReadAndCheckMetadata(client, APIServer, metadatafile, user, accessGroups)
+
 		if err != nil {
 			log.Fatal("Error in CheckMetadata function: ", err)
 		}
 		//log.Printf("metadata object: %v\n", metaDataMap)
 
-		// assemble list of datasetFolders (=datasets) to be created
-		var datasetFolders []string
-		if folderlistingPath == "" {
-			datasetFolders = append(datasetFolders, metaSourceFolder)
+		// assemble list of datasetPaths (=datasets) to be created
+		var datasetPaths []string
+		if folderListingTxt == "" {
+			datasetPaths = append(datasetPaths, metadataSourceFolder)
 		} else {
 			// get folders from file
-			folderlist, err := os.ReadFile(folderlistingPath)
+			folderlist, err := os.ReadFile(folderListingTxt)
 			if err != nil {
 				log.Fatal(err)
 			}
 			lines := strings.Split(string(folderlist), "\n")
 			// remove all empty and comment lines
 			for _, line := range lines {
-				if line != "" && string(line[0]) != "#" {
-					// NOTE what is this special third level "data" folder that needs to be unsymlinked?
-					// convert into canonical form only for certain online data linked from eaccounts home directories
-					var parts = strings.Split(line, "/")
-					if len(parts) > 3 && parts[3] == "data" {
-						realSourceFolder, err := filepath.EvalSymlinks(line)
-						if err != nil {
-							log.Fatalf("Failed to find canonical form of sourceFolder:%v %v", line, err)
-						}
-						color.Set(color.FgYellow)
-						log.Printf("Transform sourceFolder %v to canonical form: %v", line, realSourceFolder)
-						color.Unset()
-						datasetFolders = append(datasetFolders, realSourceFolder)
-					} else {
-						datasetFolders = append(datasetFolders, line)
+				if line == "" || string(line[0]) == "#" {
+					continue
+				}
+				// NOTE what is this special third level "data" folder that needs to be unsymlinked?
+				// convert into canonical form only for certain online data linked from eaccounts home directories
+				var parts = strings.Split(line, "/")
+				if len(parts) > 3 && parts[3] == "data" {
+					realSourceFolder, err := filepath.EvalSymlinks(line)
+					if err != nil {
+						log.Fatalf("Failed to find canonical form of sourceFolder:%v %v\n", line, err)
 					}
+					color.Set(color.FgYellow)
+					log.Printf("Transform sourceFolder %v to canonical form: %v\n", line, realSourceFolder)
+					color.Unset()
+					datasetPaths = append(datasetPaths, realSourceFolder)
+				} else {
+					datasetPaths = append(datasetPaths, line)
 				}
 			}
 		}
 		// log.Printf("Selected folders: %v\n", folders)
 
 		// test if a sourceFolder already used in the past and give warning
-		datasetIngestor.TestForExistingSourceFolder(datasetFolders, client, APIServer, user["accessToken"], allowExistingSourceFolderPtr)
+		foundList, err := datasetIngestor.TestForExistingSourceFolder(datasetPaths, client, APIServer, user["accessToken"])
+		if err != nil {
+			log.Fatal(err)
+		}
+		color.Set(color.FgYellow)
+		fmt.Println("Warning! The following datasets have been found with the same sourceFolder: ")
+		for _, element := range foundList {
+			fmt.Printf("  - PID: \"%s\", sourceFolder: \"%s\"\n", element.Pid, element.SourceFolder)
+		}
+		color.Unset()
+		if !allowExistingSourceFolder && len(foundList) > 0 {
+			if cmd.Flags().Changed("allowexistingsource") {
+				log.Printf("Do you want to ingest the corresponding new datasets nevertheless (y/N) ? ")
+				scanner.Scan()
+				archiveAgain := scanner.Text()
+				if archiveAgain != "y" {
+					log.Fatalln("Aborted.")
+				}
+			} else {
+				log.Fatalln("Existing sourceFolders are not allowed. Aborted.")
+			}
+		}
 
 		// TODO ask archive system if sourcefolder is known to them. If yes no copy needed, otherwise
 		// a destination location is defined by the archive system
@@ -220,7 +239,7 @@ For Windows you need instead to specify -user username:password on the command l
 		// now everything is prepared, start to loop over all folders
 		var skip = ""
 		// check if skip flag is globally defined via flags:
-		if cmd.Flags().Lookup("linkfiles").Changed {
+		if cmd.Flags().Changed("linkfiles") {
 			switch linkfiles {
 			case "delete":
 				skip = "sA"
@@ -232,17 +251,20 @@ For Windows you need instead to specify -user username:password on the command l
 		}
 
 		var datasetList []string
-		for _, sourceFolder := range datasetFolders {
+		for _, datasetSourceFolder := range datasetPaths {
 			// ignore empty lines
-			if sourceFolder == "" {
+			if datasetSourceFolder == "" {
 				// NOTE if there are empty source folder(s), shouldn't we raise an error?
 				continue
 			}
-			metaDataMap["sourceFolder"] = sourceFolder
-			log.Printf("Scanning files in dataset %s", sourceFolder)
+			metaDataMap["sourceFolder"] = datasetSourceFolder
+			log.Printf("Scanning files in dataset %s", datasetSourceFolder)
 
-			fullFileArray, startTime, endTime, owner, numFiles, totalSize :=
-				datasetIngestor.AssembleFilelisting(sourceFolder, filelistingPath, &skip)
+			fullFileArray, startTime, endTime, owner, numFiles, totalSize, err :=
+				datasetIngestor.GetLocalFileList(datasetSourceFolder, datasetFileListTxt, &skip)
+			if err != nil {
+				log.Fatalf("Can't gather the filelist of \"%s\"", datasetSourceFolder)
+			}
 			//log.Printf("full fileListing: %v\n Start and end time: %s %s\n ", fullFileArray, startTime, endTime)
 			log.Printf("The dataset contains %v files with a total size of %v bytes.", numFiles, totalSize)
 
@@ -259,7 +281,7 @@ For Windows you need instead to specify -user username:password on the command l
 			} else {
 				// TODO: change tapecopies param type of UpadateMetaData from pointer to regular int
 				// (it's not changed within the function)
-				datasetIngestor.UpdateMetaData(client, APIServer, user, originalMap, metaDataMap, startTime, endTime, owner, &tapecopies)
+				datasetIngestor.UpdateMetaData(client, APIServer, user, originalMap, metaDataMap, startTime, endTime, owner, tapecopies)
 				pretty, _ := json.MarshalIndent(metaDataMap, "", "    ")
 
 				log.Printf("Updated metadata object:\n%s\n", pretty)
@@ -268,10 +290,13 @@ For Windows you need instead to specify -user username:password on the command l
 				// and unless copy flag defined via command line
 				if !copyFlag && !nocopyFlag { // NOTE this whole copyFlag, nocopyFlag ordeal makes no sense whatsoever
 					if !beamlineAccount {
-						err := datasetIngestor.CheckDataCentrallyAvailable(user["username"], RSYNCServer, sourceFolder)
-						if err != nil {
+						sshErr, otherErr := datasetIngestor.CheckDataCentrallyAvailableSsh(user["username"], RSYNCServer, datasetSourceFolder, os.Stdout)
+						if otherErr != nil {
+							log.Fatalf("CheckDataCentrallyAvailableSsh returned an error: %v\n", otherErr)
+						}
+						if sshErr != nil {
 							color.Set(color.FgYellow)
-							log.Printf("The source folder %v is not centrally available (decentral use case).\nThe data must first be copied to a rsync cache server.\n ", sourceFolder)
+							log.Printf("The source folder %v is not centrally available (decentral use case).\nThe data must first be copied to a rsync cache server.\n ", datasetSourceFolder)
 							color.Unset()
 							copyFlag = true
 							// check if user account
@@ -317,13 +342,20 @@ For Windows you need instead to specify -user username:password on the command l
 						metaDataMap["datasetlifecycle"].(map[string]interface{})["archiveStatusMessage"] = "datasetCreated"
 						metaDataMap["datasetlifecycle"].(map[string]interface{})["archivable"] = true
 					}
-					datasetId := datasetIngestor.IngestDataset(client, APIServer, metaDataMap, fullFileArray, user)
+					datasetId, err := datasetIngestor.IngestDataset(client, APIServer, metaDataMap, fullFileArray, user)
+					if err != nil {
+						log.Fatalf("ingestion returned an error: %v\n", err)
+					}
 					// add attachment optionally
 					if addAttachment != "" {
-						datasetIngestor.AddAttachment(client, APIServer, datasetId, metaDataMap, user["accessToken"], addAttachment, addCaption)
+						err := datasetIngestor.AddAttachment(client, APIServer, datasetId, metaDataMap, user["accessToken"], addAttachment, addCaption)
+						if err != nil {
+							log.Println("Couldn't add attachment:", err)
+						}
+						log.Printf("Attachment file %v added to dataset  %v\n", addAttachment, datasetId)
 					}
 					if copyFlag {
-						err := datasetIngestor.SyncDataToFileserver(datasetId, user, RSYNCServer, sourceFolder, absFileListing)
+						err := datasetIngestor.SyncDataToFileserver(datasetId, user, RSYNCServer, datasetSourceFolder, absFileListing)
 						if err == nil {
 							// delayed enabling
 							archivable = true
@@ -372,7 +404,12 @@ For Windows you need instead to specify -user username:password on the command l
 			log.Printf("Submitting Archive Job for the ingested datasets.\n")
 			// TODO: change param type from pointer to regular as it is unnecessary
 			//   for it to be passed as pointer
-			datasetUtils.CreateJob(client, APIServer, user, datasetList, &tapecopies)
+			_, err := datasetUtils.CreateArchivalJob(client, APIServer, user, datasetList, &tapecopies)
+			if err != nil {
+				color.Set(color.FgRed)
+				log.Printf("Could not create the archival job for the ingested datasets: %s", err.Error())
+				color.Unset()
+			}
 		}
 
 		// print out results to STDOUT, one line per dataset
@@ -402,4 +439,5 @@ func init() {
 	datasetIngestorCmd.Flags().String("addcaption", "", "Optional caption to be stored with attachment (single dataset case only)")
 
 	datasetIngestorCmd.MarkFlagsMutuallyExclusive("testenv", "devenv", "localenv", "tunnelenv")
+	//datasetIngestorCmd.MarkFlagsMutuallyExclusive("nocopy", "copy")
 }
